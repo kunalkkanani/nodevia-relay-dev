@@ -1,6 +1,6 @@
 {
   "name": "nodevia-relay-dev",
-  "version": "1.0.0",
+  "version": "0.3.0",
   "description": "Minimal WebSocket relay server for dev/testing",
   "main": "server.js",
   "scripts": {
