@@ -3,12 +3,16 @@
 const net = require("net");
 const WebSocket = require("ws");
 
-const WS_PORT = 8080;
-const TCP_PORT = 2222;
-
-// Port on the device that tunnel traffic is forwarded to.
-// Override with: TUNNEL_TARGET_PORT=9000 npm start
+const WS_PORT = parseInt(process.env.WS_PORT || "8080", 10);
+const TCP_PORT = parseInt(process.env.TCP_PORT || "2222", 10);
 const TUNNEL_TARGET_PORT = parseInt(process.env.TUNNEL_TARGET_PORT || "22", 10);
+
+// If set, every agent must send a matching token in its Register message.
+const DEVICE_TOKEN = process.env.DEVICE_TOKEN || null;
+
+// If set, TCP connections are routed only to the named device.
+// If unset, routes to the first registered device (single-device mode).
+const TARGET_DEVICE_ID = process.env.TARGET_DEVICE_ID || null;
 
 // clients: id -> { ws, deviceId, tcpSocket }
 const clients = new Map();
@@ -18,10 +22,15 @@ let nextClientId = 1;
 
 const wsServer = new WebSocket.Server({ port: WS_PORT });
 console.log(`[relay] agent port  : ws://localhost:${WS_PORT}`);
+if (DEVICE_TOKEN) {
+  console.log(`[relay] auth        : token required`);
+} else {
+  console.log(`[relay] auth        : WARN — no DEVICE_TOKEN set, all agents accepted`);
+}
 
 wsServer.on("connection", (ws) => {
   const id = nextClientId++;
-  const entry = { ws, deviceId: null, tcpSocket: null };
+  const entry = { ws, deviceId: null, authenticated: false, tcpSocket: null };
   clients.set(id, entry);
 
   console.log(`[+] client-${id} connected  (total: ${clients.size})`);
@@ -36,12 +45,10 @@ wsServer.on("connection", (ws) => {
     }
 
     const text = data.toString();
-    console.log(`[>] client-${id} sent: ${text}`);
     handleMessage(id, ws, entry, text);
   });
 
   ws.on("close", () => {
-    // Clean up any open tunnel when the agent disconnects
     if (entry.tcpSocket && !entry.tcpSocket.destroyed) {
       entry.tcpSocket.destroy();
     }
@@ -58,10 +65,13 @@ wsServer.on("connection", (ws) => {
 // ─── TCP server (users connect here to tunnel into the device) ─────────────
 
 const tcpServer = net.createServer((tcpSocket) => {
-  const agent = getRegisteredAgent();
+  const agent = getTargetAgent();
 
   if (!agent) {
-    console.log("[tunnel] no registered agent — rejecting TCP connection");
+    const reason = TARGET_DEVICE_ID
+      ? `device '${TARGET_DEVICE_ID}' not connected`
+      : "no registered agent";
+    console.log(`[tunnel] ${reason} — rejecting TCP connection`);
     tcpSocket.destroy();
     return;
   }
@@ -71,12 +81,10 @@ const tcpServer = net.createServer((tcpSocket) => {
     `[tunnel] new connection → forwarding to '${agent.deviceId}' port ${TUNNEL_TARGET_PORT}`
   );
 
-  // Tell the agent to open a TCP connection to the target port on its machine
   agent.ws.send(
     JSON.stringify({ type: "tunnel_open", host: "localhost", port: TUNNEL_TARGET_PORT })
   );
 
-  // TCP data from the user → binary WebSocket frame → agent → local service
   tcpSocket.on("data", (data) => {
     if (agent.ws.readyState === WebSocket.OPEN) {
       agent.ws.send(data);
@@ -107,16 +115,34 @@ function handleMessage(id, ws, entry, text) {
   try {
     msg = JSON.parse(text);
   } catch {
-    ws.send(`echo:${text}`);
+    ws.send(JSON.stringify({ type: "error", message: "invalid JSON" }));
     return;
   }
 
   if (msg.type === "register") {
+    // Token validation — reject immediately if token doesn't match
+    if (DEVICE_TOKEN) {
+      if (msg.token !== DEVICE_TOKEN) {
+        console.warn(`[auth] client-${id} rejected — invalid or missing token`);
+        ws.send(JSON.stringify({ type: "error", message: "unauthorized" }));
+        ws.close(1008, "unauthorized");
+        return;
+      }
+    }
+
     entry.deviceId = msg.device_id;
+    entry.authenticated = true;
     console.log(
       `[relay] registered device_id='${msg.device_id}' hostname='${msg.hostname}' platform='${msg.platform}'`
     );
     ws.send(JSON.stringify({ type: "ack", device_id: msg.device_id }));
+    return;
+  }
+
+  // All other messages require a completed registration
+  if (!entry.authenticated) {
+    console.warn(`[auth] client-${id} sent '${msg.type}' before registering — closing`);
+    ws.close(1008, "register first");
     return;
   }
 
@@ -133,10 +159,14 @@ function handleMessage(id, ws, entry, text) {
   ws.send(JSON.stringify({ type: "echo", payload: msg }));
 }
 
-// Returns the first agent that has completed registration.
-function getRegisteredAgent() {
+// Returns the target agent for a new TCP connection.
+// If TARGET_DEVICE_ID is set, finds that specific device.
+// Otherwise returns the first authenticated agent.
+function getTargetAgent() {
   for (const [, entry] of clients) {
-    if (entry.deviceId) return entry;
+    if (!entry.authenticated) continue;
+    if (TARGET_DEVICE_ID && entry.deviceId !== TARGET_DEVICE_ID) continue;
+    return entry;
   }
   return null;
 }
